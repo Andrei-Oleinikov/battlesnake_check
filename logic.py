@@ -1,5 +1,6 @@
 """
-MCTS-based move-selection for Battlesnake with heuristic fallback.
+MCTS-based move-selection for Battlesnake with heuristic fallback and
+defensive out-of-bounds protection.
 
 Board: (0,0) bottom-left.
 up=+y, down=-y, left=-x, right=+x.
@@ -27,43 +28,80 @@ HUNGRY_THRESHOLD = 50
 # MCTS constants
 MCTS_TIME_LIMIT_MS = 450  # leave 50 ms safety margin
 MCTS_C = 1.4               # UCB exploration constant
-ROLLOUT_DEPTH = 15         # max rollout depth in MCTS
-DEATH_SCORE = -1000.0      # score when our snake dies
+ROLLOUT_DEPTH = 15         # max rollout depth
+DEATH_SCORE = -1000.0
 
 
 def get_info() -> Dict[str, str]:
     return {
         "apiversion": "1",
-        "author": "hackathon_mcts",
+        "author": "hackathon_mcts_v2",
         "color": "#6434eb",
         "head": "smart-caterpillar",
         "tail": "weight",
-        "version": "2.0.0",
+        "version": "2.0.1",
     }
 
 
 # -------------------------------------------------------------------
-#  Main entry point
+#  Main entry point with final legality check
 # -------------------------------------------------------------------
 
 def choose_move(game_state: Dict) -> str:
-    """Choose move with MCTS; fall back to enhanced heuristic if low on time."""
+    """Choose move with MCTS; fall back to enhanced heuristic.
+    Final move is validated against real game state to prevent
+    out-of-bounds / collision moves from ever being returned."""
     start = time.time()
-    # fast fail-safe: if almost no time left, skip MCTS
-    if time.time() - start > 0.4:   # unlikely at first call
-        return choose_move_heuristic_enhanced(game_state)
-    try:
-        return mcts_move(game_state, MCTS_TIME_LIMIT_MS)
-    except Exception:
-        return choose_move_heuristic_enhanced(game_state)
+    # If almost no time, skip MCTS and go straight to heuristic
+    if time.time() - start > 0.4:
+        move = choose_move_heuristic_enhanced(game_state)
+    else:
+        try:
+            move = mcts_move(game_state, MCTS_TIME_LIMIT_MS)
+        except Exception:
+            move = choose_move_heuristic_enhanced(game_state)
+
+    # --- Defensive check: ensure the move is actually legal right now ---
+    board = game_state["board"]
+    width, height = board["width"], board["height"]
+    head = (game_state["you"]["head"]["x"], game_state["you"]["head"]["y"])
+    occupied = _occupied_cells(board["snakes"])
+    # Our own tail might be free – allow moving there if safe
+    you = game_state["you"]
+    my_tail = (you["body"][-1]["x"], you["body"][-1]["y"]) if len(you["body"]) > 1 else None
+    if my_tail and my_tail in occupied:
+        occupied.remove(my_tail)
+
+    # If chosen move is illegal, pick the first legal move from all directions
+    if not _is_move_legal(move, head, occupied, width, height):
+        for m in DIRECTIONS:
+            if _is_move_legal(m, head, occupied, width, height):
+                return m
+        # truly trapped – return a harmless direction (server will ignore anyway)
+        return "up"
+
+    return move
+
+
+def _is_move_legal(move: str, head: Point, occupied: Set[Point],
+                   width: int, height: int) -> bool:
+    if move not in DIRECTIONS:
+        return False
+    dx, dy = DIRECTIONS[move]
+    nxt = (head[0] + dx, head[1] + dy)
+    if not (0 <= nxt[0] < width and 0 <= nxt[1] < height):
+        return False
+    if nxt in occupied:
+        return False
+    return True
 
 
 # -------------------------------------------------------------------
-#  Enhanced heuristic (fallback) – smarter version of your original
+#  Enhanced heuristic (fallback) – tail‑aware, safe
 # -------------------------------------------------------------------
 
 def choose_move_heuristic_enhanced(game_state: Dict) -> str:
-    """Improved heuristic with tail-awareness and better flood-fill."""
+    """Improved heuristic with tail‑awareness and better flood‑fill."""
     board = game_state["board"]
     you = game_state["you"]
     width, height = board["width"], board["height"]
@@ -86,7 +124,6 @@ def choose_move_heuristic_enhanced(game_state: Dict) -> str:
         if nxt in occupied:
             continue
 
-        # Reachable space from nxt, taking into account that enemy tails might free
         space = _flood_fill_loose(nxt, snakes, you["id"], width, height,
                                   limit=my_length + 1)
         score = float(space)
@@ -109,14 +146,11 @@ def _occupied_cells_except_our_tail(snakes: List[Dict], you: Dict) -> Set[Point]
     """All occupied cells, but remove our own tail if we won't grow."""
     occupied = set()
     my_id = you["id"]
-    my_body = [(seg["x"], seg["y"]) for seg in you["body"]]
-    my_tail = my_body[-1] if my_body else None
     for snake in snakes:
         for seg in snake["body"]:
             occupied.add((seg["x"], seg["y"]))
-    # Remove our tail if we are not eating (conservative: we don't know if we eat this turn,
-    # but when evaluating a move we already know if nxt is food – handled in MCTS, not here).
-    # For heuristic we assume we will NOT eat (so tail frees up) to open more options.
+    my_body = [(seg["x"], seg["y"]) for seg in you["body"]]
+    my_tail = my_body[-1] if my_body else None
     if my_tail and my_tail in occupied:
         occupied.remove(my_tail)
     return occupied
@@ -124,19 +158,16 @@ def _occupied_cells_except_our_tail(snakes: List[Dict], you: Dict) -> Set[Point]
 
 def _flood_fill_loose(start: Point, snakes: List[Dict], my_id: str,
                       width: int, height: int, limit: int) -> int:
-    """Count reachable cells from start, assuming enemy tails may free up."""
-    # Build initial occupied set: all snake bodies, but exclude tail of any snake
-    # (they might move). For safety we keep heads and all other segments.
+    """Count reachable cells, assuming enemy tails may free up."""
     occupied = set()
-    tails = set()
     for snake in snakes:
         body = [(seg["x"], seg["y"]) for seg in snake["body"]]
         for i, seg in enumerate(body):
             if i == len(body) - 1:
-                tails.add(seg)   # tail might disappear
+                # tail may disappear – don't block
+                pass
             else:
                 occupied.add(seg)
-    # Our start must not be in occupied (already checked in caller)
     seen = {start}
     stack = [start]
     count = 0
@@ -153,7 +184,6 @@ def _flood_fill_loose(start: Point, snakes: List[Dict], my_id: str,
                 continue
             if nbr in occupied:
                 continue
-            # Allow moving into a tail cell (might become free)
             seen.add(nbr)
             stack.append(nbr)
     return count
@@ -175,11 +205,10 @@ class GameState:
         self.alive = set(alive)
 
     def copy(self) -> 'GameState':
-        # deep copy everything needed
         new_snakes = {}
         for sid, s in self.snakes.items():
             new_snakes[sid] = {
-                'body': s['body'][:],   # copy list of tuples
+                'body': s['body'][:],
                 'health': s['health']
             }
         return GameState(self.width, self.height, new_snakes,
@@ -190,22 +219,14 @@ class GameState:
         (excluding own tail if not growing)."""
         s = self.snakes[snake_id]
         head = s['body'][0]
-        body_set = set(s['body'])
-        # Determine if tail will be freed (not growing). We can't know for sure,
-        # so we allow moving into own tail if we're not eating now.
-        # In the move generation phase we don't yet know if we'll eat.
-        # We'll conservatively allow moving into own tail always, but disallow
-        # if it would cause a collision with another snake's body.
-        own_tail = s['body'][-1]
         moves = []
         for move, (dx, dy) in DIRECTIONS.items():
             nxt = (head[0] + dx, head[1] + dy)
             if not (0 <= nxt[0] < self.width and 0 <= nxt[1] < self.height):
                 continue
-            # Check collision with all snake bodies (including ours)
+            # Check collision with all snake bodies (excluding our own tail)
             collision = False
             for sid2, s2 in self.snakes.items():
-                # For our own snake, exclude tail if it's ours (allowed)
                 if sid2 == snake_id:
                     # exclude own tail from collision check
                     body_to_check = s2['body'][:-1]  # all but tail
@@ -222,10 +243,10 @@ class GameState:
 
     def apply_moves(self, moves: Dict[str, str]) -> 'GameState':
         """Return a new state after all given snakes move.
-        moves: dict snake_id -> direction string."""
+        Handles head-on-head, stationary heads, food, and health."""
         state = self.copy()
 
-        # 1. Determine new heads
+        # 1. Determine new heads for moving snakes
         new_heads = {}
         for sid, move in moves.items():
             if sid not in state.alive:
@@ -236,79 +257,75 @@ class GameState:
             new_heads[sid] = (hx + dx, hy + dy)
 
         # 2. Resolve collisions and eating
-        # Multiple snakes can collide in a cell; equal-length head-to-head kills both.
-        # Also check wall/body (already ensured by legal_moves, but re-check for safety).
         eaten_food = set()
         dead = set()
 
-        # Collision map: cell -> list of snake ids that moved there
+        # Build collision map: cell -> list of snake ids with new heads there
         cell_to_snakes: Dict[Point, List[str]] = {}
         for sid, nh in new_heads.items():
             cell_to_snakes.setdefault(nh, []).append(sid)
 
+        # Also need to account for snakes that didn't move: their head cells
+        # are occupied and moving into them is death for the mover.
+        stationary_heads: Dict[Point, List[str]] = {}
+        for sid in state.alive:
+            if sid not in moves:  # didn't move
+                head = state.snakes[sid]['body'][0]
+                stationary_heads.setdefault(head, []).append(sid)
+
         for cell, sids in cell_to_snakes.items():
+            # First, if this cell is also a stationary head cell,
+            # the movers die (since stationary head is already there).
+            if cell in stationary_heads:
+                # All moving snakes into this cell die
+                for sid in sids:
+                    dead.add(sid)
+                continue
+
+            # Now regular head-to-head among movers
             if len(sids) > 1:
-                # Head-to-head collision between those snakes
-                # Sort by length descending? Rules: if all same length, all die;
-                # otherwise only the longest survive? Actually Battlesnake rules:
-                # If multiple snakes enter the same cell, all die. Wait:
-                # Official: "If two snakes move into the same cell, both are eliminated
-                # (unless one is longer, in which case the shorter dies)."
-                # Let's implement: keep only the longest, if unique; else all die.
                 lengths = {sid: len(state.snakes[sid]['body']) for sid in sids}
                 max_len = max(lengths.values())
-                # count how many have max_len
                 max_count = sum(1 for l in lengths.values() if l == max_len)
                 if max_count == 1:
-                    # only one longest survives
                     survivor = [sid for sid, l in lengths.items() if l == max_len][0]
                     for sid in sids:
                         if sid != survivor:
                             dead.add(sid)
                 else:
-                    # all tied for longest die
                     for sid in sids:
                         dead.add(sid)
             else:
                 sid = sids[0]
-                # Single snake moving here: check if cell contains body of any snake
-                # that didn't free up. Bodies after movement are old bodies minus tails.
-                # We'll handle bodies later; for now, just check food.
+                # Single mover to this cell, check food
                 if cell in state.food:
                     eaten_food.add(cell)
 
-        # 3. Update health and bodies
+        # 3. Update health and bodies for survivors
         for sid in state.alive:
             if sid in dead:
                 continue
             s = state.snakes[sid]
-            # Decrease health
             s['health'] -= 1
             if s['health'] <= 0:
                 dead.add(sid)
                 continue
 
-            # Move body
             move = moves.get(sid)
-            if move is None:   # didn't move (shouldn't happen)
+            if move is None:  # stayed still
                 continue
             new_head = new_heads[sid]
             body = s['body']
-            # Insert new head
             body.insert(0, new_head)
-            # Remove tail if not eating
             if new_head not in eaten_food:
                 body.pop()
             else:
-                # Ate food: reset health to 100 (max health)
-                s['health'] = 100
-                # food removed below
+                s['health'] = 100  # ate food
 
         # 4. Remove eaten food
         state.food -= eaten_food
 
-        # 5. Remove dead snakes' bodies from future collisions?
-        # They disappear immediately. So remove them from state.
+        # 5. Remove dead snakes
         for sid in dead:
             state.alive.discard(sid)
             if sid in state.snakes:
@@ -317,11 +334,9 @@ class GameState:
         return state
 
     def is_terminal(self, my_id: str) -> bool:
-        """Terminal if we are dead or no enemies alive."""
         return my_id not in self.alive or len(self.alive) == 1
 
     def score(self, my_id: str) -> float:
-        """Heuristic evaluation from our perspective (non-terminal)."""
         if my_id not in self.alive:
             return DEATH_SCORE
         me = self.snakes[my_id]
@@ -329,54 +344,49 @@ class GameState:
         health = me['health']
         my_len = len(me['body'])
 
-        # Flood fill space accessible to us (with tail awareness)
+        # Reachable space (flood fill with tail awareness)
         space = self._flood_fill_self(head, my_id)
 
-        # Distance to nearest food
         food_dist = float('inf')
         if self.food:
             food_dist = min(_manhattan(head, f) for f in self.food)
 
-        # Enemy metrics
         enemy_lengths = [len(s['body']) for sid, s in self.snakes.items() if sid != my_id]
         max_enemy_len = max(enemy_lengths) if enemy_lengths else 0
         enemy_heads = [s['body'][0] for sid, s in self.snakes.items() if sid != my_id]
+
         danger_near = 0.0
         for ehead in enemy_heads:
             d = _manhattan(head, ehead)
-            if d == 1:  # adjacent
-                enemy_len = len(self.snakes[[sid for sid in self.snakes if sid != my_id][0]]['body'])
-                if enemy_len >= my_len:
+            if d == 1:
+                eid = [sid for sid in self.snakes if sid != my_id][0]  # simplistic
+                if eid in self.snakes and len(self.snakes[eid]['body']) >= my_len:
                     danger_near += 10.0
 
-        # Composite score (weights tuned empirically)
         score = 0.0
-        score += space * 2.0             # open space is king
-        score += health * 0.5            # survival
-        score -= min(food_dist, 20) * 1.0  # prefer closer food
-        score -= danger_near             # avoid risky heads
-        # Bonus for being longer than all
+        score += space * 2.0
+        score += health * 0.5
+        score -= min(food_dist, 20) * 1.0
+        score -= danger_near
         if my_len > max_enemy_len:
             score += 20.0
-
         return score
 
     def _flood_fill_self(self, start: Point, my_id: str) -> int:
-        """Flood fill from start, considering that our tail will free up
-        and enemy tails might free. Conservative: treat only our tail as sure to free."""
-        # Occupied cells: all snake bodies except our tail.
+        """Flood fill from start, own tail is free, others' tails maybe free."""
         occupied = set()
         for sid, s in self.snakes.items():
             body = s['body']
             if sid == my_id and len(body) > 1:
-                # exclude our tail
+                # exclude own tail
                 occupied.update(body[:-1])
             else:
-                occupied.update(body)
+                # exclude tail of other snakes (conservative: may block)
+                occupied.update(body[:-1] if len(body) > 1 else body)
         seen = {start}
         stack = [start]
         count = 0
-        while stack and count < 200:  # cap
+        while stack and count < 200:
             x, y = stack.pop()
             count += 1
             for dx, dy in DIRECTIONS.values():
@@ -409,68 +419,51 @@ def state_from_game(game_state: Dict) -> GameState:
 
 
 class MCTSNode:
-    __slots__ = ('state', 'move', 'parent', 'children', 'visits', 'total_score', 'untried_moves')
+    __slots__ = ('state', 'move', 'parent', 'children', 'visits',
+                 'total_score', 'untried_moves')
 
-    def __init__(self, state: GameState, move: Optional[str] = None, parent: Optional['MCTSNode'] = None):
+    def __init__(self, state: GameState, move: Optional[str] = None,
+                 parent: Optional['MCTSNode'] = None):
         self.state = state
-        self.move = move          # move that led to this state from parent
+        self.move = move
         self.parent = parent
         self.children: Dict[str, MCTSNode] = {}
         self.visits = 0
         self.total_score = 0.0
-        my_id = list(state.alive)[0] if state.alive else ""   # placeholder, real my_id passed later
-        # We'll initialise untried_moves properly in search
         self.untried_moves: List[str] = []
 
     def ucb1(self, C: float) -> float:
         if self.visits == 0:
             return float('inf')
-        return self.total_score / self.visits + C * (__import__('math').sqrt(__import__('math').log(self.parent.visits) / self.visits))
+        return self.total_score / self.visits + C * (
+            __import__('math').sqrt(__import__('math').log(self.parent.visits) / self.visits)
+        )
 
 
 def mcts_move(game_state: Dict, time_limit_ms: float) -> str:
-    """Run MCTS from the current game state and return best move."""
+    """Run MCTS from current state, return best move."""
     start_time = time.time()
     root_state = state_from_game(game_state)
     my_id = game_state["you"]["id"]
 
     root = MCTSNode(root_state)
-    # legal moves for us
     legal = root_state.legal_moves(my_id)
     if not legal:
         return "up"
     root.untried_moves = legal[:]
 
-    # Main MCTS loop
     while (time.time() - start_time) * 1000 < time_limit_ms:
         node = root
-        state = root_state.copy()
-
         # 1. Selection
         while node.untried_moves == [] and node.children:
-            # choose child with max UCB1
-            best = max(node.children.values(), key=lambda c: c.ucb1(MCTS_C))
-            node = best
-            # apply move to state: need to simulate all snakes' moves.
-            # But our tree only branches on our moves; opponent moves were sampled.
-            # We stored the state in the child node, so we can just use child.state.
-            # However, for consistent selection we must update state to child.state.
-            # Actually, to keep state accurate along the path, we can set state = node.state.
-            # That works because each node already holds the exact state after the move.
-            # So just state = node.state (already done by construction).
-            pass
+            node = max(node.children.values(), key=lambda c: c.ucb1(MCTS_C))
 
-        # Now node is a leaf in the tree (might be terminal or have untried moves)
-        if node.state.is_terminal(my_id) or not node.untried_moves:
-            # If terminal or no moves, evaluate directly (no rollout needed)
-            score = node.state.score(my_id)
-        else:
-            # 2. Expansion: pick a random untried move
+        # 2. Expansion
+        if not node.state.is_terminal(my_id) and node.untried_moves:
             move = random.choice(node.untried_moves)
             node.untried_moves.remove(move)
 
-            # Simulate opponent moves for this step (random)
-            # Build moves dict: our move + random for others
+            # Build moves for all alive snakes
             moves_dict = {}
             for sid in node.state.alive:
                 if sid == my_id:
@@ -479,17 +472,18 @@ def mcts_move(game_state: Dict, time_limit_ms: float) -> str:
                     opp_moves = node.state.legal_moves(sid)
                     if opp_moves:
                         moves_dict[sid] = random.choice(opp_moves)
-                    # else snake can't move – dies? We'll handle by not adding,
-                    # apply_moves will just skip, snake remains and may collide.
+                    # else snake can't move – stays still (dies if head‑on)
 
-            # Create new state after this full step
             next_state = node.state.apply_moves(moves_dict)
             child = MCTSNode(next_state, move=move, parent=node)
             node.children[move] = child
 
-            # 3. Rollout from child
+            # 3. Rollout
             score = _rollout(child.state, my_id, ROLLOUT_DEPTH)
             node = child
+        else:
+            # no untried moves and not terminal – evaluate directly
+            score = node.state.score(my_id)
 
         # 4. Backpropagation
         while node is not None:
@@ -497,13 +491,15 @@ def mcts_move(game_state: Dict, time_limit_ms: float) -> str:
             node.total_score += score
             node = node.parent
 
-    # After time is up, pick move with most visits from root
+    # Pick move with most visits
+    if not root.children:
+        return random.choice(legal) if legal else "up"
     best_move = max(root.children.items(), key=lambda kv: kv[1].visits)[0]
     return best_move
 
 
 def _rollout(state: GameState, my_id: str, depth: int) -> float:
-    """Simulate random moves for all snakes up to depth or terminal state."""
+    """Simulate random moves for all snakes up to depth or terminal."""
     current = state.copy()
     for _ in range(depth):
         if current.is_terminal(my_id):
@@ -518,7 +514,7 @@ def _rollout(state: GameState, my_id: str, depth: int) -> float:
 
 
 # -------------------------------------------------------------------
-#  Utility functions (kept from original)
+#  Utility functions
 # -------------------------------------------------------------------
 
 def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
